@@ -7,8 +7,9 @@ use std::io::{Lines, prelude::*};
 use std::path::PathBuf;
 use regex::Regex;
 use std::collections::HashSet;
+use glob::glob;
 
-static mut cpuids: Vec<String> = Vec::new();
+//static mut cpuids: Vec<String> = Vec::new();
 
 use std::collections::HashMap;
 
@@ -34,14 +35,47 @@ struct  Signature {
     params: Vec<FunctionParam>,
     rettype: String
 }
+impl ToString for Signature {
+    fn to_string(&self) -> String {
+        let mut r = String::new();
+        let ret = self.rettype.clone() + " ";
+        let name = self.name.clone() + "(";
+        r += "\x1b[1m\x1b[35m"; /* bold on, magenta */
+        r += &ret;
+        r += "\x1b[33m";
+        r += &name;
+        r += "\x1b[0m\x1b[1m";
+
+        for i in 0..self.params.len() {
+            let param = &self.params[i];
+            r += "\x1b[35m";
+            r += &param.arg_type;
+            r += "\x1b[0m\x1b[1m";
+            r += " ";
+            r += &param.name;
+            if(i != self.params.len() - 1)
+            {
+                r += ", ";
+            }
+        }
+        r += "\x1b[33m\x1b[1m";
+        r += ")";
+        r += "\x1b[0m";
+        r
+    }
+}
+
 
 #[derive(Eq, Hash, PartialEq)]
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct Intrinsic {
     instruction: String,
     signature: Signature, 
-    synopsis: Synopsis
+    synopsis: Synopsis,
+    description: String,
+    operation: String,
 }
+
 
 /*
 AVX_512
@@ -82,29 +116,43 @@ struct Intrinsics {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    
-    /// If set, these files will be found recursively and analysed
-    #[arg(short, long)]
-    recursive_file_extensions: Vec<String>,
 
     /// if set, these files will be excluded
-    #[arg(long)]
+    #[arg(short, long)]
     exclude_list: Vec<std::path::PathBuf>,
 
     /// files to include, mutually exclusive with recursive_file_extensions option
     #[arg(short, long)]
     files: Vec<std::path::PathBuf>,
 
-    /// startdir
-    #[arg(short, long, default_value = ".")]
-    startdir: std::path::PathBuf,
+    /// List the cpuid flags necessary for the intrinsics used in the files specified
+    #[arg(long, default_value = "true")]
+    list_cpuid_flags: bool,
+
+    /// list the intrinsics used in the files specified
+    #[arg(long, default_value = "false")]
+    list_intrinsics: bool,
+
+    /// list the intrinsics used and a description of them
+    #[arg(long, default_value = "false")]
+    list_info: bool,
+
+    /// list the intrinsics used and pseudocode of how they work
+    #[arg(long, default_value = "false")]
+    list_operation: bool,
+
+    /// list the intrinsics used and cpuid flags each one requires (different from list_cpuid_flags which lists the required flags for all code files scanned)
+    #[arg(long, default_value = "false")]
+    list_cpuid: bool,
+
+    #[arg(long, short, default_value = "/usr/share/simd-detective-intrinsics.json")]
+    data_file: PathBuf,
 }
 
 fn load_file(file_path: &PathBuf) -> String
 {
     let mut s = String::new();
     let display = file_path.display();
-    println!("{}", file_path.display());
     let mut file = match File::open(&file_path) {
         Err(why) => panic!("couldn't open {}: {}", display, why),
         Ok(file) => file,
@@ -116,15 +164,11 @@ fn load_file(file_path: &PathBuf) -> String
     }
 }
 
-fn load_intrinsics_data() -> Intrinsics {
-    let b =  match PathBuf::from_str("./data/intrinsics.json") {
-        Ok(value) => value,
-        Err(e) => panic!("Error: {}", e),
-    };
-    let data_json = load_file(&b);
+fn load_intrinsics_data(path: &PathBuf) -> Intrinsics {
+    let data_json = load_file(path);
     let data: Result<Intrinsics, serde_json::Error> = serde_json::from_str(&data_json);
     return match data {
-        Err(why) => panic!("couldn't read jso data file! {}: {}", b.display(), why),
+        Err(why) => panic!("couldn't read json data file! {}: {}", path.display(), why),
         Ok(s) => s
     };
 }
@@ -187,34 +231,67 @@ fn check_for_intrinsics<'a>(file_contents: &str, by_name: &'a HashMap<String, In
         if occurences > 0 {
             r.insert(k.1);
         }
-        
     }
-
     r
 }
 
 fn main()
 {
     let args: Args = Args::parse();
-    let raw_data: Intrinsics  = load_intrinsics_data();
+    let raw_data: Intrinsics  = load_intrinsics_data(&args.data_file);
     let by_name = build_intrinsic_name_hashmap(&raw_data);
     let num = by_name.keys().len();
-    print!("num keys {}", num);
-    
-    if !args.recursive_file_extensions.is_empty() {
-        if !args.files.is_empty() {
-            println!("Mutually exclusive options -r and -f passed! exiting");
-            std::process::exit(1);
-        }
-        // recursive
-    }
+
     if !args.files.is_empty() {
-        // specific files
+        let mut cpuids: HashSet<String> = HashSet::new();
+        let mut intrinsics: HashSet<&Intrinsic> = HashSet::new();
+        
         for file_path in args.files {
-            let file_contents = remove_comments(&load_file(&file_path));
-            let res = check_for_intrinsics(&file_contents, &by_name);
-            for intrinsic in res {
-                println!("{}", &intrinsic.signature.name);
+            let fp_string = file_path.to_str().unwrap();
+            if fp_string.contains("*") {
+                for entry in glob(fp_string).expect("Failed to read glob pattern") {
+                    let glob_path = match entry {
+                        Ok(path) => path,
+                        Err(e) => !panic!("{:?}", e),
+                    };
+                    let file_contents = remove_comments(&load_file(&file_path));
+                    let res = check_for_intrinsics(&file_contents, &by_name);
+                    intrinsics.extend(res);
+                }
+                
+            }
+            else {
+                let file_contents = remove_comments(&load_file(&file_path));
+                let res = check_for_intrinsics(&file_contents, &by_name);
+                intrinsics.extend(res);
+            }
+        }
+        for intrinsic in intrinsics {
+            for s in &intrinsic.synopsis.cpuids {
+                cpuids.insert(s.to_string());
+            }
+            if args.list_intrinsics || args.list_info || args.list_operation {
+                println!("{}\n", &intrinsic.signature.to_string());
+            }
+            if args.list_info {
+                println!("{}\n", &intrinsic.description);
+            }
+            if args.list_operation {
+                println!("{}\n", &intrinsic.operation);
+            }
+            if args.list_cpuid_flags {
+                print!("\x1b[31m");
+                for id in &intrinsic.synopsis.cpuids {
+                    print!("{} ", id);
+                }
+                print!("\x1b[0m\n");
+            }
+            println!("");
+            //if args.lis
+        }
+        if args.list_cpuid_flags {
+            for cpuid in cpuids {
+                println!("{}", cpuid);
             }
         }
     }
